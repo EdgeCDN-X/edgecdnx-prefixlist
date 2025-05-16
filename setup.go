@@ -7,10 +7,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/ancientlore/go-avltree"
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
-	"github.com/google/btree"
 	"gopkg.in/yaml.v3"
 )
 
@@ -19,8 +19,8 @@ func init() { plugin.Register("edgecdnxprefixlist", setup) }
 
 type EdgeCDNXPrefixListRouting struct {
 	FilePath  string
-	RoutingV4 *btree.BTreeG[net.IPNet]
-	RoutingV6 *btree.BTreeG[net.IPNet]
+	RoutingV4 *avltree.Tree
+	RoutingV6 *avltree.Tree
 }
 
 type Prefix struct {
@@ -59,52 +59,62 @@ func setup(c *caddy.Controller) error {
 
 	routing := &EdgeCDNXPrefixListRouting{
 		FilePath: args[0],
-		RoutingV4: btree.NewG(1, func(a, b net.IPNet) bool {
-			starta := a.IP.To4()
-			enda := a.IP.To4()
-			for i := 0; i < len(a.Mask); i++ {
-				enda[i] |= ^a.Mask[i]
+		RoutingV4: avltree.New(func(a interface{}, b interface{}) int {
+			starta := a.(net.IPNet).IP.To4()
+			enda := a.(net.IPNet).IP.To4()
+			for i := 0; i < len(a.(net.IPNet).Mask); i++ {
+				enda[i] |= ^a.(net.IPNet).Mask[i]
 			}
 
-			startb := b.IP.To4()
-			endb := b.IP.To4()
-			for i := 0; i < len(b.Mask); i++ {
-				endb[i] |= ^b.Mask[i]
+			startb := b.(net.IPNet).IP.To4()
+			endb := b.(net.IPNet).IP.To4()
+			for i := 0; i < len(b.(net.IPNet).Mask); i++ {
+				endb[i] |= ^b.(net.IPNet).Mask[i]
 			}
 
-			if bytes.Compare(enda, startb) < -1 {
-				return true
+			if bytes.Compare(enda, startb) == -1 {
+				return -1
 			}
 
-			if bytes.Compare(endb, starta) < -1 {
-				return false
+			if bytes.Compare(starta, endb) == 1 {
+				return 1
 			}
 
-			return true
-		}),
-		RoutingV6: btree.NewG(1, func(a, b net.IPNet) bool {
-			starta := a.IP.To4()
-			enda := a.IP.To4()
-			for i := 0; i < len(a.Mask); i++ {
-				enda[i] |= ^a.Mask[i]
+			if bytes.Compare(starta, startb) == -1 && bytes.Compare(enda, startb) < 1 {
+				return 0
 			}
 
-			startb := b.IP.To4()
-			endb := b.IP.To4()
-			for i := 0; i < len(b.Mask); i++ {
-				endb[i] |= ^b.Mask[i]
+			log.Debug(fmt.Sprintf("this case should not happend, %v, %v, %v, %v", starta, enda, startb, endb))
+			return 0
+		}, 0),
+		RoutingV6: avltree.New(func(a interface{}, b interface{}) int {
+			starta := a.(net.IPNet).IP.To16()
+			enda := a.(net.IPNet).IP.To16()
+			for i := 0; i < len(a.(net.IPNet).Mask); i++ {
+				enda[i] |= ^a.(net.IPNet).Mask[i]
 			}
 
-			if bytes.Compare(enda, startb) < -1 {
-				return true
+			startb := b.(net.IPNet).IP.To16()
+			endb := b.(net.IPNet).IP.To16()
+			for i := 0; i < len(b.(net.IPNet).Mask); i++ {
+				endb[i] |= ^b.(net.IPNet).Mask[i]
 			}
 
-			if bytes.Compare(endb, starta) < -1 {
-				return false
+			if bytes.Compare(enda, startb) == -1 {
+				return -1
 			}
 
-			return true
-		}),
+			if bytes.Compare(starta, endb) == 1 {
+				return 1
+			}
+
+			if bytes.Compare(starta, startb) == -1 && bytes.Compare(enda, startb) < 1 {
+				return 0
+			}
+
+			log.Debug(fmt.Sprintf("this case should not happend, %v, %v, %v, %v", starta, enda, startb, endb))
+			return 0
+		}, 0),
 	}
 
 	files, err := filepath.Glob(filepath.Join(routing.FilePath, "*.yaml"))
@@ -129,6 +139,7 @@ func setup(c *caddy.Controller) error {
 		}
 
 		// TODO load prefixes to RBTree. Before that we have to check if prefixes are overlapping.
+
 	}
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
