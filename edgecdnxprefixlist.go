@@ -12,6 +12,8 @@ import (
 	clog "github.com/coredns/coredns/plugin/pkg/log"
 	"github.com/coredns/coredns/request"
 
+	"github.com/coredns/coredns/plugin/metadata"
+
 	"github.com/miekg/dns"
 )
 
@@ -21,7 +23,8 @@ var log = clog.NewWithPlugin("edgecdnxprefixlist")
 
 // Example is an example plugin to show how to write a plugin.
 type EdgeCDNXPrefixList struct {
-	Next plugin.Handler
+	Next    plugin.Handler
+	Routing *EdgeCDNXPrefixListRouting
 }
 
 type EdgeCDNXPrefixListResponseWriter struct {
@@ -37,38 +40,63 @@ func (e EdgeCDNXPrefixList) ServeDNS(ctx context.Context, w dns.ResponseWriter, 
 
 	// Debug log that we've have seen the query. This will only be shown when the debug plugin is loaded.
 
-	state := request.Request{W: w, Req: r}
+	return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
 
-	qname := state.Name()
-	qtype := state.Type()
+	// state := request.Request{W: w, Req: r}
 
-	log.Debug(fmt.Sprintf("edgecdnxprefixlist: %s %s", qname, qtype))
+	// qname := state.Name()
+	// qtype := state.Type()
 
-	res := new(dns.A)
-	res.Hdr = dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 180}
-	res.A = net.IPv4(192, 168, 0, 100) // Example IP address
+	// log.Debug(fmt.Sprintf("edgecdnxprefixlist: %s %s", qname, qtype))
 
-	m := new(dns.Msg)
-	m.SetReply(r)
-	m.Authoritative = true
-	m.Answer = append(m.Answer, res)
-	state.SizeAndDo(m)
-	m = state.Scrub(m)
+	// res := new(dns.A)
+	// res.Hdr = dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 180}
+	// res.A = net.IPv4(192, 168, 0, 100) // Example IP address
 
-	log.Debug(fmt.Sprintf("edgecdnxprefixlist: %v", m))
+	// m := new(dns.Msg)
+	// m.SetReply(r)
+	// m.Authoritative = true
+	// m.Answer = append(m.Answer, res)
+	// state.SizeAndDo(m)
+	// m = state.Scrub(m)
 
-	err := w.WriteMsg(m)
-	if err != nil {
-		log.Error(fmt.Sprintf("edgecdnxprefixlist: %v", err))
-		return dns.RcodeServerFailure, err
-	}
-	return dns.RcodeSuccess, nil
+	// log.Debug(fmt.Sprintf("edgecdnxprefixlist: %v", m))
 
-	// Export metric with the server label set to the current server handling the request.
-	// requestCount.WithLabelValues(metrics.WithServer(ctx)).Inc()
+	// err := w.WriteMsg(m)
+	// if err != nil {
+	// 	log.Error(fmt.Sprintf("edgecdnxprefixlist: %v", err))
+	// 	return dns.RcodeServerFailure, err
+	// }
+	// return dns.RcodeSuccess, nil
 
-	// Call next plugin (if any).
+	// // Export metric with the server label set to the current server handling the request.
+	// // requestCount.WithLabelValues(metrics.WithServer(ctx)).Inc()
+
+	// // Call next plugin (if any).
 	// return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
+}
+
+func (g EdgeCDNXPrefixList) Metadata(ctx context.Context, state request.Request) context.Context {
+
+	srcIP := net.ParseIP(state.IP())
+
+	if o := state.Req.IsEdns0(); o != nil {
+		for _, s := range o.Option {
+			if e, ok := s.(*dns.EDNS0_SUBNET); ok {
+				srcIP = e.Address
+				break
+			}
+		}
+	}
+
+	log.Debug(fmt.Sprintf("edgecdnxprefixlist: Request coming from src IP: %s", srcIP.String()))
+	log.Debug(fmt.Sprintf("edgecdnxprefixlist: Config path: %s", g.Routing.FilePath))
+
+	metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
+		return "eu-west-1"
+	})
+
+	return ctx
 }
 
 // Name implements the Handler interface.
