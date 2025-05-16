@@ -42,9 +42,9 @@ type Routing struct {
 	Routing RoutingInner `yaml:"routing"`
 }
 
-func RoutingV4Comparator(a, b net.IPNet) bool {
-	// Compare the IP networks based on their CIDR notation
-	return bytes.Compare(a.IP, b.IP) < 0
+type PrefixTreeEntry struct {
+	Location string
+	Prefix   net.IPNet
 }
 
 // setup is the function that gets called when the config parser see the token "example". Setup is responsible
@@ -60,16 +60,20 @@ func setup(c *caddy.Controller) error {
 	routing := &EdgeCDNXPrefixListRouting{
 		FilePath: args[0],
 		RoutingV4: avltree.New(func(a interface{}, b interface{}) int {
-			starta := a.(net.IPNet).IP.To4()
-			enda := a.(net.IPNet).IP.To4()
-			for i := 0; i < len(a.(net.IPNet).Mask); i++ {
-				enda[i] |= ^a.(net.IPNet).Mask[i]
+			starta := a.(PrefixTreeEntry).Prefix.IP.To4()
+			enda := make(net.IP, len(starta))
+			copy(enda, starta)
+
+			for i := 0; i < len(a.(PrefixTreeEntry).Prefix.Mask); i++ {
+				enda[i] |= ^a.(PrefixTreeEntry).Prefix.Mask[i]
 			}
 
-			startb := b.(net.IPNet).IP.To4()
-			endb := b.(net.IPNet).IP.To4()
-			for i := 0; i < len(b.(net.IPNet).Mask); i++ {
-				endb[i] |= ^b.(net.IPNet).Mask[i]
+			startb := b.(PrefixTreeEntry).Prefix.IP.To4()
+			endb := make(net.IP, len(startb))
+			copy(endb, startb)
+
+			for i := 0; i < len(b.(PrefixTreeEntry).Prefix.Mask); i++ {
+				endb[i] |= ^b.(PrefixTreeEntry).Prefix.Mask[i]
 			}
 
 			if bytes.Compare(enda, startb) == -1 {
@@ -84,20 +88,25 @@ func setup(c *caddy.Controller) error {
 				return 0
 			}
 
-			log.Debug(fmt.Sprintf("this case should not happend, %v, %v, %v, %v", starta, enda, startb, endb))
+			if bytes.Compare(starta, startb) == 0 {
+				return 0
+			}
+
 			return 0
 		}, 0),
 		RoutingV6: avltree.New(func(a interface{}, b interface{}) int {
-			starta := a.(net.IPNet).IP.To16()
-			enda := a.(net.IPNet).IP.To16()
-			for i := 0; i < len(a.(net.IPNet).Mask); i++ {
-				enda[i] |= ^a.(net.IPNet).Mask[i]
+			starta := a.(PrefixTreeEntry).Prefix.IP.To16()
+			enda := make(net.IP, len(starta))
+			copy(enda, starta)
+			for i := 0; i < len(a.(PrefixTreeEntry).Prefix.Mask); i++ {
+				enda[i] |= ^a.(PrefixTreeEntry).Prefix.Mask[i]
 			}
 
-			startb := b.(net.IPNet).IP.To16()
-			endb := b.(net.IPNet).IP.To16()
-			for i := 0; i < len(b.(net.IPNet).Mask); i++ {
-				endb[i] |= ^b.(net.IPNet).Mask[i]
+			startb := b.(PrefixTreeEntry).Prefix.IP.To16()
+			endb := make(net.IP, len(startb))
+			copy(endb, startb)
+			for i := 0; i < len(b.(PrefixTreeEntry).Prefix.Mask); i++ {
+				endb[i] |= ^b.(PrefixTreeEntry).Prefix.Mask[i]
 			}
 
 			if bytes.Compare(enda, startb) == -1 {
@@ -112,7 +121,10 @@ func setup(c *caddy.Controller) error {
 				return 0
 			}
 
-			log.Debug(fmt.Sprintf("this case should not happend, %v, %v, %v, %v", starta, enda, startb, endb))
+			if bytes.Compare(starta, startb) == 0 {
+				return 0
+			}
+
 			return 0
 		}, 0),
 	}
@@ -125,7 +137,7 @@ func setup(c *caddy.Controller) error {
 	// Process each YAML file (e.g., validate or load into memory)
 	for _, file := range files {
 		// Example: Log the file name or perform further processing
-		log.Debug(fmt.Printf("Found YAML file: %s\n", file))
+		log.Debug(fmt.Sprintf("Found YAML file: %s\n", file))
 
 		content, err := os.ReadFile(file)
 		if err != nil {
@@ -134,13 +146,38 @@ func setup(c *caddy.Controller) error {
 
 		var data Routing
 		if err := yaml.Unmarshal(content, &data); err != nil {
-			log.Debug(fmt.Sprintf("unmarshal error %v", err))
+			log.Error(fmt.Sprintf("unmarshal error %v", err))
 			return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse YAML file %s: %w", file, err))
 		}
 
-		// TODO load prefixes to RBTree. Before that we have to check if prefixes are overlapping.
+		// TODO Check for overlaps and duplicates.
+		for _, v := range data.Routing.Prefix.V4 {
+			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+			if err != nil {
+				log.Error(fmt.Sprintf("parse cidr error %v", err))
+				return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse CIDR %s/%d: %w", v.Address, v.Size, err))
+			}
+			log.Debug(fmt.Sprintf("Adding V4 CIDR %s/%d\n", v.Address, v.Size))
+			routing.RoutingV4.Add(PrefixTreeEntry{
+				Location: data.Routing.Location,
+				Prefix:   *ipnet,
+			})
+		}
 
+		for _, v := range data.Routing.Prefix.V6 {
+			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+			if err != nil {
+				log.Error(fmt.Sprintf("parse cidr error %v", err))
+				return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse CIDR %s/%d: %w", v.Address, v.Size, err))
+			}
+			log.Debug(fmt.Sprintf("Adding V6 CIDR %s/%d\n", v.Address, v.Size))
+			routing.RoutingV6.Add(PrefixTreeEntry{
+				Location: data.Routing.Location,
+				Prefix:   *ipnet,
+			})
+		}
 	}
+
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		return EdgeCDNXPrefixList{Next: next, Routing: routing}

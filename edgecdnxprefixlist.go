@@ -89,12 +89,39 @@ func (g EdgeCDNXPrefixList) Metadata(ctx context.Context, state request.Request)
 		}
 	}
 
-	log.Debug(fmt.Sprintf("edgecdnxprefixlist: Request coming from src IP: %s", srcIP.String()))
-	log.Debug(fmt.Sprintf("edgecdnxprefixlist: Config path: %s", g.Routing.FilePath))
+	log.Debug(fmt.Sprintf("srcIP %s\n", srcIP))
 
-	metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
-		return "eu-west-1"
-	})
+	if srcIP.To4() != nil {
+		dest := g.Routing.RoutingV4.Find(PrefixTreeEntry{
+			Prefix: net.IPNet{
+				IP:   srcIP,
+				Mask: net.CIDRMask(32, 32),
+			},
+		})
+
+		if dest != nil {
+			log.Debug(fmt.Sprintf("Found V4 prefix %s", dest))
+			metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
+				return dest.(PrefixTreeEntry).Location
+			})
+		}
+	}
+
+	if srcIP.To16() != nil {
+		dest := g.Routing.RoutingV6.Find(PrefixTreeEntry{
+			Prefix: net.IPNet{
+				IP:   srcIP,
+				Mask: net.CIDRMask(128, 128),
+			},
+		})
+
+		if dest != nil {
+			log.Debug(fmt.Sprintf("Found V6 prefix %s", dest))
+			metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
+				return dest.(PrefixTreeEntry).Location
+			})
+		}
+	}
 
 	return ctx
 }
