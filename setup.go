@@ -2,23 +2,30 @@ package edgecdnxprefixlist
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 
 	"github.com/ancientlore/go-avltree"
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
-	"gopkg.in/yaml.v3"
+
+	"k8s.io/apimachinery/pkg/runtime"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
+
+	infrastructurev1alpha1 "github.com/EdgeCDN-X/edgecdnx-controller/api/v1alpha1"
 )
 
 // init registers this plugin.
 func init() { plugin.Register("edgecdnxprefixlist", setup) }
 
 type EdgeCDNXPrefixListRouting struct {
-	FilePath  string
+	Namespace string
 	RoutingV4 *avltree.Tree
 	RoutingV6 *avltree.Tree
 }
@@ -50,7 +57,17 @@ type PrefixTreeEntry struct {
 // setup is the function that gets called when the config parser see the token "example". Setup is responsible
 // for parsing any extra options the example plugin may have. The first token this function sees is "example".
 func setup(c *caddy.Controller) error {
-	c.Next() // Ignore "example" and give us the next token.
+	scheme := runtime.NewScheme()
+	clientsetscheme.AddToScheme(scheme)
+	infrastructurev1alpha1.AddToScheme(scheme)
+
+	kubeconfig := ctrl.GetConfigOrDie()
+	kubeclient, err := client.New(kubeconfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to create Kubernetes client: %w", err))
+	}
+
+	c.Next()
 
 	args := c.RemainingArgs()
 	if len(args) != 1 {
@@ -58,7 +75,7 @@ func setup(c *caddy.Controller) error {
 	}
 
 	routing := &EdgeCDNXPrefixListRouting{
-		FilePath: args[0],
+		Namespace: args[0],
 		RoutingV4: avltree.New(func(a interface{}, b interface{}) int {
 			starta := a.(PrefixTreeEntry).Prefix.IP.To4()
 			enda := make(net.IP, len(starta))
@@ -129,29 +146,15 @@ func setup(c *caddy.Controller) error {
 		}, 0),
 	}
 
-	files, err := filepath.Glob(filepath.Join(routing.FilePath, "*.yaml"))
-	if err != nil {
-		return plugin.Error("edgecdnxprefixlist", err)
+	prefixLists := &infrastructurev1alpha1.PrefixListList{}
+	if err := kubeclient.List(context.TODO(), prefixLists, &client.ListOptions{
+		Namespace: routing.Namespace,
+	}); err != nil {
+		return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to list EdgeCDNXPrefixList resources: %w", err))
 	}
 
-	// Process each YAML file (e.g., validate or load into memory)
-	for _, file := range files {
-		// Example: Log the file name or perform further processing
-		log.Debug(fmt.Sprintf("Found YAML file: %s\n", file))
-
-		content, err := os.ReadFile(file)
-		if err != nil {
-			return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to read file %s: %w", file, err))
-		}
-
-		var data Routing
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			log.Error(fmt.Sprintf("unmarshal error %v", err))
-			return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse YAML file %s: %w", file, err))
-		}
-
-		// TODO Check for overlaps and duplicates.
-		for _, v := range data.Routing.Prefix.V4 {
+	for _, prefixList := range prefixLists.Items {
+		for _, v := range prefixList.Spec.Prefix.V4 {
 			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
 			if err != nil {
 				log.Error(fmt.Sprintf("parse cidr error %v", err))
@@ -159,12 +162,12 @@ func setup(c *caddy.Controller) error {
 			}
 			log.Debug(fmt.Sprintf("Adding V4 CIDR %s/%d\n", v.Address, v.Size))
 			routing.RoutingV4.Add(PrefixTreeEntry{
-				Location: data.Routing.Location,
+				Location: prefixList.Spec.Destination,
 				Prefix:   *ipnet,
 			})
 		}
 
-		for _, v := range data.Routing.Prefix.V6 {
+		for _, v := range prefixList.Spec.Prefix.V6 {
 			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
 			if err != nil {
 				log.Error(fmt.Sprintf("parse cidr error %v", err))
@@ -172,7 +175,7 @@ func setup(c *caddy.Controller) error {
 			}
 			log.Debug(fmt.Sprintf("Adding V6 CIDR %s/%d\n", v.Address, v.Size))
 			routing.RoutingV6.Add(PrefixTreeEntry{
-				Location: data.Routing.Location,
+				Location: prefixList.Spec.Destination,
 				Prefix:   *ipnet,
 			})
 		}
