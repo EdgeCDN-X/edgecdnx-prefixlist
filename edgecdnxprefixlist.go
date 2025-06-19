@@ -46,8 +46,6 @@ func (g EdgeCDNXPrefixList) Metadata(ctx context.Context, state request.Request)
 			}
 		}
 	}
-	log.Debug(fmt.Sprintf("Setting up static routing meta for request incoming from %s\n", srcIP))
-
 	metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
 		if srcIP.To4() != nil {
 			dest := g.Routing.RoutingV4.Find(PrefixTreeEntry{
