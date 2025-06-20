@@ -2,21 +2,27 @@ package edgecdnxprefixlist
 
 import (
 	"bytes"
-	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/ancientlore/go-avltree"
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 
 	infrastructurev1alpha1 "github.com/EdgeCDN-X/edgecdnx-controller/api/v1alpha1"
 )
@@ -28,25 +34,6 @@ type EdgeCDNXPrefixListRouting struct {
 	Namespace string
 	RoutingV4 *avltree.Tree
 	RoutingV6 *avltree.Tree
-}
-
-type Prefix struct {
-	V4 []AddressPrefix `yaml:"v4"`
-	V6 []AddressPrefix `yaml:"v6"`
-}
-
-type AddressPrefix struct {
-	Address string `yaml:"address"`
-	Size    int    `yaml:"size"`
-}
-
-type RoutingInner struct {
-	Location string `yaml:"location"`
-	Prefix   Prefix `yaml:"prefix"`
-}
-
-type Routing struct {
-	Routing RoutingInner `yaml:"routing"`
 }
 
 type PrefixTreeEntry struct {
@@ -62,11 +49,6 @@ func setup(c *caddy.Controller) error {
 	infrastructurev1alpha1.AddToScheme(scheme)
 
 	kubeconfig := ctrl.GetConfigOrDie()
-	kubeclient, err := client.New(kubeconfig, client.Options{Scheme: scheme})
-	if err != nil {
-		return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to create Kubernetes client: %w", err))
-	}
-
 	c.Next()
 
 	args := c.RemainingArgs()
@@ -101,14 +83,6 @@ func setup(c *caddy.Controller) error {
 				return 1
 			}
 
-			if bytes.Compare(starta, startb) == -1 && bytes.Compare(enda, startb) < 1 {
-				return 0
-			}
-
-			if bytes.Compare(starta, startb) == 0 {
-				return 0
-			}
-
 			return 0
 		}, 0),
 		RoutingV6: avltree.New(func(a interface{}, b interface{}) int {
@@ -134,56 +108,217 @@ func setup(c *caddy.Controller) error {
 				return 1
 			}
 
-			if bytes.Compare(starta, startb) == -1 && bytes.Compare(enda, startb) < 1 {
-				return 0
-			}
-
-			if bytes.Compare(starta, startb) == 0 {
-				return 0
-			}
-
 			return 0
 		}, 0),
 	}
-
-	prefixLists := &infrastructurev1alpha1.PrefixListList{}
-	if err := kubeclient.List(context.TODO(), prefixLists, &client.ListOptions{
-		Namespace: routing.Namespace,
-	}); err != nil {
-		return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to list EdgeCDNXPrefixList resources: %w", err))
+	clientSet, err := dynamic.NewForConfig(kubeconfig)
+	if err != nil {
+		return plugin.Error("edgecdnxservices", fmt.Errorf("failed to create dynamic client: %w", err))
 	}
+	fac := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clientSet, 10*time.Minute, args[0], nil)
 
-	for _, prefixList := range prefixLists.Items {
-		for _, v := range prefixList.Spec.Prefix.V4 {
-			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
-			if err != nil {
-				log.Error(fmt.Sprintf("parse cidr error %v", err))
-				return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse CIDR %s/%d: %w", v.Address, v.Size, err))
-			}
-			log.Debug(fmt.Sprintf("Adding V4 CIDR %s/%d\n", v.Address, v.Size))
-			routing.RoutingV4.Add(PrefixTreeEntry{
-				Location: prefixList.Spec.Destination,
-				Prefix:   *ipnet,
-			})
-		}
+	informer := fac.ForResource(schema.GroupVersionResource{
+		Group:    infrastructurev1alpha1.GroupVersion.Group,
+		Version:  infrastructurev1alpha1.GroupVersion.Version,
+		Resource: "prefixlists",
+	}).Informer()
 
-		for _, v := range prefixList.Spec.Prefix.V6 {
-			_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
-			if err != nil {
-				log.Error(fmt.Sprintf("parse cidr error %v", err))
-				return plugin.Error("edgecdnxprefixlist", fmt.Errorf("failed to parse CIDR %s/%d: %w", v.Address, v.Size, err))
+	sem := &sync.RWMutex{}
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			p_raw, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				log.Errorf("edgecdnxprefixlist: expected PrefixList object, got %T", p_raw)
+				return
 			}
-			log.Debug(fmt.Sprintf("Adding V6 CIDR %s/%d\n", v.Address, v.Size))
-			routing.RoutingV6.Add(PrefixTreeEntry{
-				Location: prefixList.Spec.Destination,
-				Prefix:   *ipnet,
-			})
-		}
-	}
+			temp, err := json.Marshal(p_raw.Object)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to marshal PrefixList object: %v", err)
+				return
+			}
+			prefixList := &infrastructurev1alpha1.PrefixList{}
+			err = json.Unmarshal(temp, prefixList)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to unmarshal PrefixList object: %v", err)
+				return
+			}
+			sem.Lock()
+			defer sem.Unlock()
+			for _, v := range prefixList.Spec.Prefix.V4 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Adding V4 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV4.Add(PrefixTreeEntry{
+					Location: prefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			for _, v := range prefixList.Spec.Prefix.V6 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Adding V6 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV6.Add(PrefixTreeEntry{
+					Location: prefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			log.Infof("edgecdnxprefixlist: Added PrefixList %s", prefixList.Name)
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			p_old_raw, ok := oldObj.(*unstructured.Unstructured)
+			if !ok {
+				log.Errorf("edgecdnxprefixlist: expected PrefixList object, got %T", p_old_raw)
+				return
+			}
+			temp, err := json.Marshal(p_old_raw.Object)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to marshal PrefixList object: %v", err)
+				return
+			}
+			oldPrefixList := &infrastructurev1alpha1.PrefixList{}
+			err = json.Unmarshal(temp, oldPrefixList)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to unmarshal PrefixList object: %v", err)
+				return
+			}
+
+			p_new_raw, ok := newObj.(*unstructured.Unstructured)
+			if !ok {
+				log.Errorf("edgecdnxprefixlist: expected PrefixList object, got %T", p_new_raw)
+				return
+			}
+			temp, err = json.Marshal(p_new_raw.Object)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to marshal PrefixList object: %v", err)
+				return
+			}
+			newPrefixList := &infrastructurev1alpha1.PrefixList{}
+			err = json.Unmarshal(temp, newPrefixList)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to unmarshal PrefixList object: %v", err)
+				return
+			}
+
+			sem.Lock()
+			defer sem.Unlock()
+			for _, v := range oldPrefixList.Spec.Prefix.V4 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Removing V4 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV4.Remove(PrefixTreeEntry{
+					Location: oldPrefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			for _, v := range oldPrefixList.Spec.Prefix.V6 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Removing V6 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV6.Remove(PrefixTreeEntry{
+					Location: oldPrefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			for _, v := range newPrefixList.Spec.Prefix.V4 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Adding V4 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV4.Add(PrefixTreeEntry{
+					Location: newPrefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			for _, v := range newPrefixList.Spec.Prefix.V6 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Adding V6 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV6.Add(PrefixTreeEntry{
+					Location: newPrefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			log.Infof("edgecdnxprefixlist: Updated PrefixList %s", newPrefixList.Name)
+		},
+		DeleteFunc: func(obj any) {
+			p_raw, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				log.Errorf("edgecdnxprefixlist: expected PrefixList object, got %T", p_raw)
+				return
+			}
+			temp, err := json.Marshal(p_raw.Object)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to marshal PrefixList object: %v", err)
+				return
+			}
+			prefixList := &infrastructurev1alpha1.PrefixList{}
+			err = json.Unmarshal(temp, prefixList)
+			if err != nil {
+				log.Errorf("edgecdnxprefixlist: failed to unmarshal PrefixList object: %v", err)
+				return
+			}
+
+			sem.Lock()
+			defer sem.Unlock()
+			for _, v := range prefixList.Spec.Prefix.V4 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Removing V4 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV4.Remove(PrefixTreeEntry{
+					Location: prefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			for _, v := range prefixList.Spec.Prefix.V6 {
+				_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", v.Address, v.Size))
+				if err != nil {
+					log.Error(fmt.Sprintf("parse cidr error %v", err))
+					return
+				}
+				log.Debug(fmt.Sprintf("Removing V6 CIDR %s/%d\n", v.Address, v.Size))
+				routing.RoutingV6.Remove(PrefixTreeEntry{
+					Location: prefixList.Spec.Destination,
+					Prefix:   *ipnet,
+				})
+			}
+			log.Infof("edgecdnxprefixlist: Deleted PrefixList %s", prefixList.Name)
+		},
+	})
+
+	factoryCloseChan := make(chan struct{})
+	fac.Start(factoryCloseChan)
+
+	c.OnShutdown(func() error {
+		log.Infof("edgecdnxprefixlist: Shutting down informer")
+		close(factoryCloseChan)
+		fac.Shutdown()
+		return nil
+	})
 
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		return EdgeCDNXPrefixList{Next: next, Routing: routing}
+		return EdgeCDNXPrefixList{Next: next, Routing: routing, Sync: &sync.RWMutex{}, InformerSynced: informer.HasSynced}
 	})
 
 	// All OK, return a nil error.

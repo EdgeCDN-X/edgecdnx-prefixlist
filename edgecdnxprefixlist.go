@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/coredns/coredns/plugin"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
@@ -23,8 +24,10 @@ var log = clog.NewWithPlugin("edgecdnxprefixlist")
 
 // Example is an example plugin to show how to write a plugin.
 type EdgeCDNXPrefixList struct {
-	Next    plugin.Handler
-	Routing *EdgeCDNXPrefixListRouting
+	Next           plugin.Handler
+	Routing        *EdgeCDNXPrefixListRouting
+	Sync           *sync.RWMutex
+	InformerSynced func() bool
 }
 
 type EdgeCDNXPrefixListResponseWriter struct {
@@ -47,6 +50,8 @@ func (g EdgeCDNXPrefixList) Metadata(ctx context.Context, state request.Request)
 		}
 	}
 	metadata.SetValueFunc(ctx, g.Name()+"/location", func() string {
+		g.Sync.RLock()
+		defer g.Sync.RUnlock()
 		if srcIP.To4() != nil {
 			dest := g.Routing.RoutingV4.Find(PrefixTreeEntry{
 				Prefix: net.IPNet{
