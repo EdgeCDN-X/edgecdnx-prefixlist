@@ -3,7 +3,7 @@ module github.com/EdgeCDN-X/edgecdnx-prefixlist
 go 1.25.0
 
 require (
-	github.com/EdgeCDN-X/edgecdnx-controller v0.12.0
+	github.com/EdgeCDN-X/edgecdnx-controller v0.15.0
 	github.com/ancientlore/go-avltree v1.0.3
 	github.com/coredns/caddy v1.1.2-0.20241029205200-8de985351a98
 	github.com/coredns/coredns v1.12.2

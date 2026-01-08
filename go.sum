@@ -1,5 +1,5 @@
-github.com/EdgeCDN-X/edgecdnx-controller v0.12.0 h1:ml5PbdbNqXwaXcF4HThxZVnYMLEGduutX4DF/bRNV/I=
-github.com/EdgeCDN-X/edgecdnx-controller v0.12.0/go.mod h1:0a1T6YuWuGXFEqLETmk91y1XcpU2hAU1+g6BqjSAl6I=
+github.com/EdgeCDN-X/edgecdnx-controller v0.15.0 h1:WDvmwboWX9ItjqwRonuH+PV2/3gYn+Wm9rDb18ydJ2M=
+github.com/EdgeCDN-X/edgecdnx-controller v0.15.0/go.mod h1:/1MHGPD6YknBhlvxXCw/9DbGxa0sbePpPk4yWn3sWAI=
 github.com/ancientlore/go-avltree v1.0.3 h1:V5MzMHDgM5wn9Zttb+/gcRREetOSz/3WdMW6iOYNg1I=
 github.com/ancientlore/go-avltree v1.0.3/go.mod h1:++CjrwcE5evH/2Vi8WqJlqNaNiNvj+jBG/Fa6MnZv/E=
 github.com/apparentlymart/go-cidr v1.1.0 h1:2mAhrMoF+nhXqxTzSZMUzDHkLjmIHC+Zzn4tdgBZjnU=
